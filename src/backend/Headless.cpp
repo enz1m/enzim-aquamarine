@@ -130,12 +130,25 @@ std::vector<SP<SPollFD>> Aquamarine::CHeadlessBackend::pollFDs() {
     return {makeShared<SPollFD>(timers.timerfd.get(), [this]() { dispatchTimers(); })};
 }
 
+// enzUI: a compositor started with only this backend (a remote login, with
+// no seat and no parent compositor) renders on the render node named by
+// ENZUI_RENDER_NODE. Without it, as upstream, headless has no device.
+static int enzuiRenderNode() {
+    static const int FD = [] {
+        const char* node = getenv("ENZUI_RENDER_NODE");
+        if (!node || strncmp(node, "/dev/dri/renderD", 16) != 0)
+            return -1;
+        return open(node, O_RDWR | O_CLOEXEC);
+    }();
+    return FD;
+}
+
 int Aquamarine::CHeadlessBackend::drmFD() {
-    return -1;
+    return enzuiRenderNode();
 }
 
 int Aquamarine::CHeadlessBackend::drmRenderNodeFD() {
-    return -1;
+    return enzuiRenderNode();
 }
 
 bool Aquamarine::CHeadlessBackend::dispatchEvents() {
