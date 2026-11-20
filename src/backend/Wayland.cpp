@@ -117,20 +117,27 @@ bool Aquamarine::CWaylandBackend::start() {
         const std::string NAME = name;
 
         if (NAME == "wl_seat") {
-            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, 9, id)));
-            waylandState.seat = makeShared<CCWlSeat>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &wl_seat_interface, 9));
+            if (version < 5)
+                return;
+            const auto bindVersion = std::min(version, 9u);
+            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, bindVersion, id)));
+            waylandState.seat = makeShared<CCWlSeat>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &wl_seat_interface, bindVersion));
             initSeat();
         } else if (NAME == "xdg_wm_base") {
-            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, 6, id)));
-            waylandState.xdg = makeShared<CCXdgWmBase>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &xdg_wm_base_interface, 6));
+            const auto bindVersion = std::min(version, 6u);
+            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, bindVersion, id)));
+            waylandState.xdg = makeShared<CCXdgWmBase>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &xdg_wm_base_interface, bindVersion));
             initShell();
         } else if (NAME == "wl_compositor") {
-            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, 6, id)));
-            waylandState.compositor = makeShared<CCWlCompositor>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &wl_compositor_interface, 6));
+            if (version < 4)
+                return;
+            const auto bindVersion = std::min(version, 6u);
+            TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, bindVersion, id)));
+            waylandState.compositor = makeShared<CCWlCompositor>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &wl_compositor_interface, bindVersion));
         } else if (NAME == "wl_shm") {
             TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, 1, id)));
             waylandState.shm = makeShared<CCWlShm>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &wl_shm_interface, 1));
-        } else if (NAME == "zwp_linux_dmabuf_v1") {
+        } else if (NAME == "zwp_linux_dmabuf_v1" && version >= 4) {
             TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, 4, id)));
             waylandState.dmabuf =
                 makeShared<CCZwpLinuxDmabufV1>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &zwp_linux_dmabuf_v1_interface, 4));
@@ -183,6 +190,9 @@ bool Aquamarine::CWaylandBackend::createOutput(const std::string& szName) {
     if (backend->ready)
         o->swapchain = CSwapchain::create(backend->primaryAllocator, self.lock());
     idleCallbacks.emplace_back([this, o]() { backend->events.newOutput.emit(SP<IOutput>(o)); });
+    // Send the new toplevel now: requests are otherwise flushed only when the parent
+    // compositor sends an event, and a quiet parent waits for this one to configure it.
+    wl_display_flush(waylandState.display);
     return true;
 }
 
