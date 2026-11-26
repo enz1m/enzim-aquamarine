@@ -9,6 +9,7 @@
 #include <wayland-client.h>
 #include <wayland.hpp>
 #include <xdg-shell.hpp>
+#include <presentation-time.hpp>
 #include <linux-dmabuf-v1.hpp>
 #include <tuple>
 
@@ -42,6 +43,8 @@ namespace Aquamarine {
     class CWaylandOutput : public IOutput {
       public:
         virtual ~CWaylandOutput();
+        bool                                                              disableForPrivacy() override;
+        bool                                                              canConfirmPrivatePresentation() const override;
         virtual bool                                                      commit();
         virtual bool                                                      test();
         virtual Hyprutils::Memory::CSharedPointer<IBackendImplementation> getBackend();
@@ -59,12 +62,20 @@ namespace Aquamarine {
       private:
         CWaylandOutput(const std::string& name_, Hyprutils::Memory::CWeakPointer<CWaylandBackend> backend_);
 
-        Hyprutils::Memory::CWeakPointer<CWaylandBackend>  backend;
+        Hyprutils::Memory::CWeakPointer<CWaylandBackend>                         backend;
 
-        Hyprutils::Memory::CSharedPointer<CWaylandBuffer> wlBufferFromBuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buffer);
+        Hyprutils::Memory::CSharedPointer<CWaylandBuffer>                        wlBufferFromBuffer(Hyprutils::Memory::CSharedPointer<IBuffer> buffer);
 
-        void                                              onFrameDone();
-        void                                              onEnter(Hyprutils::Memory::CSharedPointer<CCWlPointer> pointer, uint32_t serial);
+        void                                                                     trackPrivatePresentation(uint64_t serial);
+        void                                                                     forgetPrivateFeedback(CCWpPresentationFeedback* resource);
+        bool                                                                     configured         = false;
+        bool                                                                     needsInitialCommit = false;
+        Hyprutils::Memory::CSharedPointer<CCWlCallback>                          unmapSync;
+        std::vector<Hyprutils::Memory::CSharedPointer<CCWpPresentationFeedback>> privateFeedback;
+
+        void                                                                     commitInitialState();
+        void                                                                     onFrameDone();
+        void                                                                     onEnter(Hyprutils::Memory::CSharedPointer<CCWlPointer> pointer, uint32_t serial);
 
         // frame loop — unified scheduler shared with DRM. See CFrameScheduler.
         CFrameScheduler                                              sched;
@@ -128,6 +139,7 @@ namespace Aquamarine {
 
     class CWaylandBackend : public IBackendImplementation {
       public:
+        bool hasPresentationFeedback() const;
         virtual ~CWaylandBackend();
         virtual eBackendType                                               type();
         virtual bool                                                       start();
@@ -176,6 +188,7 @@ namespace Aquamarine {
 
             // hw-s types
             Hyprutils::Memory::CSharedPointer<CCWlRegistry>               registry;
+            Hyprutils::Memory::CSharedPointer<CCWpPresentation>           presentation;
             Hyprutils::Memory::CSharedPointer<CCWlSeat>                   seat;
             Hyprutils::Memory::CSharedPointer<CCWlShm>                    shm;
             Hyprutils::Memory::CSharedPointer<CCXdgWmBase>                xdg;

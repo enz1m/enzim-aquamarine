@@ -36,14 +36,30 @@ bool Aquamarine::CDRMLegacyImpl::commitInternal(Hyprutils::Memory::CSharedPointe
             mainFB = data.mainFB;
     }
 
+    const bool privateEnable = enable && connector->output->privateScanout;
+    const auto clearCursor   = [&] {
+        if (!drmModeSetCursor(connector->backend->gpu->fd, connector->crtc->id, 0, 0, 0))
+            return true;
+        connector->backend->backend->log(AQ_LOG_ERROR, "legacy drm: cursor null failed");
+        return false;
+    };
+
+    if (privateEnable && !clearCursor())
+        return false;
+
     if (data.modeset) {
         connector->backend->backend->log(AQ_LOG_DEBUG, std::format("legacy drm: Modesetting CRTC {}", connector->crtc->id));
 
-        uint32_t dpms = enable ? DRM_MODE_DPMS_ON : DRM_MODE_DPMS_OFF;
-        if (drmModeConnectorSetProperty(connector->backend->gpu->fd, connector->id, connector->props.values.dpms, dpms)) {
+        const auto setDPMS = [&] {
+            const uint32_t dpms = enable ? DRM_MODE_DPMS_ON : DRM_MODE_DPMS_OFF;
+            if (!drmModeConnectorSetProperty(connector->backend->gpu->fd, connector->id, connector->props.values.dpms, dpms))
+                return true;
+
             connector->backend->backend->log(AQ_LOG_ERROR, "legacy drm: Failed to set dpms");
             return false;
-        }
+        };
+        if (!privateEnable && !setDPMS())
+            return false;
 
         std::vector<uint32_t> connectors;
         drmModeModeInfo*      mode = nullptr;
@@ -63,6 +79,12 @@ bool Aquamarine::CDRMLegacyImpl::commitInternal(Hyprutils::Memory::CSharedPointe
             connector->backend->backend->log(AQ_LOG_ERROR, std::format("legacy drm: drmModeSetCrtc failed: {}", strerror(-ret)));
             return false;
         }
+
+        // Legacy modesets can take effect even if a later ioctl fails.
+        if (enable)
+            connector->output->scanoutDisabled = false;
+        if (privateEnable && !setDPMS())
+            return false;
     }
 
     if (data.committed & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_ADAPTIVE_SYNC) {
@@ -121,8 +143,8 @@ bool Aquamarine::CDRMLegacyImpl::commitInternal(Hyprutils::Memory::CSharedPointe
             connector->backend->backend->log(AQ_LOG_ERROR, std::format("legacy drm: cursor drmIoctl failed: {}", strerror(errno)));
             return false;
         }
-    } else if (drmModeSetCursor(connector->backend->gpu->fd, connector->crtc->id, 0, 0, 0))
-        connector->backend->backend->log(AQ_LOG_ERROR, "legacy drm: cursor null failed");
+    } else if (!privateEnable)
+        clearCursor();
 
     if (!enable)
         return true;
@@ -130,7 +152,7 @@ bool Aquamarine::CDRMLegacyImpl::commitInternal(Hyprutils::Memory::CSharedPointe
     if (!(data.flags & DRM_MODE_PAGE_FLIP_EVENT))
         return true;
 
-    const auto FLIPID = connector->crtc->armPageFlip(connector, data.flags & DRM_MODE_PAGE_FLIP_ASYNC);
+    const auto FLIPID = connector->crtc->armPageFlip(connector, data.flags & DRM_MODE_PAGE_FLIP_ASYNC, std::nullopt, 0, true, connector->output->privateFrameSerial);
 
     if (int ret = drmModePageFlip(connector->backend->gpu->fd, connector->crtc->id, mainFB ? mainFB->id : -1, data.flags, rc<void*>(FLIPID)); ret) {
         connector->backend->backend->log(AQ_LOG_ERROR, std::format("legacy drm: drmModePageFlip failed: {}", strerror(-ret)));
@@ -150,6 +172,11 @@ bool Aquamarine::CDRMLegacyImpl::testInternal(Hyprutils::Memory::CSharedPointer<
 bool Aquamarine::CDRMLegacyImpl::commit(Hyprutils::Memory::CSharedPointer<SDRMConnector> connector, SDRMConnectorCommitData& data) {
     if (!testInternal(connector, data))
         return false;
+
+    // Legacy KMS has no test-only commit. A test must not program the CRTC,
+    // which would scan out the test's buffer without the private-commit check.
+    if (data.test)
+        return true;
 
     return commitInternal(connector, data);
 }

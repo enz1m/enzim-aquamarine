@@ -26,9 +26,14 @@ Aquamarine::CHeadlessOutput::~CHeadlessOutput() {
 
 bool Aquamarine::CHeadlessOutput::commit() {
     const auto snapshot = state->snapshot();
+    if (!allowsPrivateCommit(snapshot.state()))
+        return false;
+    scanoutDisabled = !snapshot.state().enabled;
     events.commit.emit();
     state->consume(snapshot);
     needsFrame = false;
+    if (privateFrameSerial && snapshot.state().enabled)
+        events.privatePresented.emit(privateFrameSerial);
     events.present.emit(IOutput::SPresentEvent{.presented = true});
     return true;
 }

@@ -125,6 +125,8 @@ namespace Aquamarine {
         /* Checks if the backend has a session - iow if it's a DRM backend */
         bool hasSession();
 
+        bool canConfirmPrivatePresentation() const;
+
         /* Get the primary DRM FD */
         int drmFD();
 

@@ -283,6 +283,15 @@ namespace Aquamarine {
             Hyprutils::Math::Vector2D size; // if {0,0}, means it needs a reconfigure.
         };
 
+        // The consumer authorizes exactly one rendered buffer during a private commit.
+        bool                                     privateScanout     = false;
+        bool                                     scanoutDisabled    = false;
+        uint64_t                                 privateFrameSerial = 0;
+        Hyprutils::Memory::CWeakPointer<IBuffer> privateFrame;
+        virtual bool                             disableForPrivacy();
+        virtual bool                             canConfirmPrivatePresentation() const;
+        bool                                     allowsPrivateCommit(const COutputState::SInternalState& state) const;
+
         struct SPresentEvent {
             bool         presented = true;
             timespec*    when      = nullptr;
@@ -293,6 +302,8 @@ namespace Aquamarine {
         };
 
         struct {
+            Hyprutils::Signal::CSignalT<>              scanoutInvalidated;
+            Hyprutils::Signal::CSignalT<uint64_t>      privatePresented;
             Hyprutils::Signal::CSignalT<>              destroy;
             Hyprutils::Signal::CSignalT<>              frame;
             Hyprutils::Signal::CSignalT<>              needsFrame;

@@ -113,6 +113,7 @@ endfunction()
 protocolwayland()
 
 protocolnew("stable/xdg-shell" "xdg-shell" false)
+protocolnew("stable/presentation-time" "presentation-time" false)
 protocolnew("stable/linux-dmabuf" "linux-dmabuf-v1" false)
 
 # Generate hwdata info

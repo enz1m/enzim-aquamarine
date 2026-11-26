@@ -174,9 +174,10 @@ namespace Aquamarine {
         struct {
             std::optional<uintptr_t>                       id; // nullopt when nothing is in flight
             Hyprutils::Memory::CWeakPointer<SDRMConnector> connector;
-            bool                                           async       = false; // PAGE_FLIP_ASYNC
-            uint64_t                                       commitID    = 0;
-            bool                                           resultReady = true;
+            bool                                           async              = false; // PAGE_FLIP_ASYNC
+            uint64_t                                       commitID           = 0;
+            uint64_t                                       privateFrameSerial = 0;
+            bool                                           resultReady        = true;
 
             struct {
                 bool         valid = false;
@@ -187,7 +188,7 @@ namespace Aquamarine {
         } pendingFlip;
 
         uintptr_t armPageFlip(Hyprutils::Memory::CWeakPointer<SDRMConnector> connector, bool async, std::optional<uintptr_t> id = std::nullopt, uint64_t commitID = 0,
-                              bool resultReady = true);
+                              bool resultReady = true, uint64_t privateFrameSerial = 0);
         void      disarmPageFlip();
 
         struct {
@@ -233,6 +234,7 @@ namespace Aquamarine {
     class CDRMOutput : public IOutput {
       public:
         virtual ~CDRMOutput();
+        bool                                                              disableForPrivacy() override;
         virtual bool                                                      commit();
         virtual bool                                                      test();
         virtual Hyprutils::Memory::CSharedPointer<IBackendImplementation> getBackend();
@@ -285,6 +287,7 @@ namespace Aquamarine {
         bool                                                               asyncCommitEventPending = false;
         Hyprutils::Memory::CAtomicSharedPointer<CDRMCursorPositionMailbox> cursorMailbox;
 
+        friend class CDRMAtomicRequest;
         friend struct SDRMConnector;
         friend class CDRMLease;
         friend class CDRMBackend;
@@ -359,6 +362,7 @@ namespace Aquamarine {
         drmModeModeInfo*                               getCurrentMode();
         IOutput::SParsedEDID                           parseEDID(std::vector<uint8_t> data);
         bool                                           commitState(SDRMConnectorCommitData& data);
+        bool                                           disableScanout();
         void                                           applyCommit(SDRMConnectorCommitData& data);
         void                                           onPresent(bool primary = true, bool cursor = true, DRMFBList* retired = nullptr);
         void                                           recheckCRTCProps();

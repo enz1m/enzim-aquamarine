@@ -36,7 +36,8 @@ namespace Aquamarine {
 
         void         setConnector(Hyprutils::Memory::CSharedPointer<SDRMConnector> connector);
         void         addConnector(Hyprutils::Memory::CSharedPointer<SDRMConnector> connector, SDRMConnectorCommitData& data);
-        bool         restateConnectors(Hyprutils::Memory::CSharedPointer<SDRMConnector> self);
+        bool         restateConnectors(Hyprutils::Memory::CSharedPointer<SDRMConnector> self, bool disablePrivatePeers);
+        void         applyDisabledPeers();
         void         addConnectorModeset(Hyprutils::Memory::CSharedPointer<SDRMConnector> connector, SDRMConnectorCommitData& data);
         void         addConnectorCursor(Hyprutils::Memory::CSharedPointer<SDRMConnector> connector, SDRMConnectorCommitData& data);
         bool         commit(uint32_t flagssss);
@@ -62,6 +63,7 @@ namespace Aquamarine {
         Hyprutils::Memory::CSharedPointer<SDRMConnector> conn;
 
         // mode blobs minted by restateConnectors, owned by this request
-        std::vector<uint32_t> borrowedModeBlobs;
+        std::vector<uint32_t>                                         borrowedModeBlobs;
+        std::vector<Hyprutils::Memory::CSharedPointer<SDRMConnector>> disabledPeers;
     };
 };

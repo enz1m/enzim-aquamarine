@@ -67,6 +67,7 @@ Aquamarine::CWaylandBackend::~CWaylandBackend() {
     pointers.clear();
     idleCallbacks.clear();
 
+    waylandState.presentation.reset();
     waylandState.dmabufFeedback.reset();
     waylandState.dmabuf.reset();
     waylandState.shm.reset();
@@ -133,7 +134,11 @@ bool Aquamarine::CWaylandBackend::start() {
                 return;
             const auto bindVersion = std::min(version, 6u);
             TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, bindVersion, id)));
-            waylandState.compositor = makeShared<CCWlCompositor>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &wl_compositor_interface, bindVersion));
+            waylandState.compositor =
+                makeShared<CCWlCompositor>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &wl_compositor_interface, bindVersion));
+        } else if (NAME == "wp_presentation") {
+            waylandState.presentation =
+                makeShared<CCWpPresentation>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &wp_presentation_interface, 1));
         } else if (NAME == "wl_shm") {
             TRACE(backend->log(AQ_LOG_TRACE, std::format("  > binding to global: {} (version {}) with id {}", name, 1, id)));
             waylandState.shm = makeShared<CCWlShm>((wl_proxy*)wl_registry_bind((wl_registry*)waylandState.registry->resource(), id, &wl_shm_interface, 1));
@@ -161,6 +166,10 @@ bool Aquamarine::CWaylandBackend::start() {
     createOutput();
 
     return true;
+}
+
+bool Aquamarine::CWaylandBackend::hasPresentationFeedback() const {
+    return !!waylandState.presentation;
 }
 
 int Aquamarine::CWaylandBackend::drmFD() {
@@ -534,8 +543,14 @@ Aquamarine::CWaylandOutput::CWaylandOutput(const std::string& name_, Hyprutils::
     }
 
     waylandState.xdgSurface->setConfigure([this](CCXdgSurface* r, uint32_t serial) {
+        // Unmapping invalidates configure serials from the previous mapping.
+        if (needsInitialCommit)
+            return;
+
         backend->backend->log(AQ_LOG_DEBUG, std::format("Output {}: configure surface with {}", name, serial));
         r->sendAckConfigure(serial);
+        configured = true;
+        scheduleFrame(AQ_SCHEDULE_NEEDS_FRAME);
     });
 
     waylandState.xdgToplevel = makeShared<CCXdgToplevel>(waylandState.xdgSurface->sendGetToplevel());
@@ -549,6 +564,9 @@ Aquamarine::CWaylandOutput::CWaylandOutput(const std::string& name_, Hyprutils::
         [this](CCXdgToplevel* r, wl_array* arr) { backend->backend->log(AQ_LOG_DEBUG, std::format("Output {}: wm_capabilities received", name)); });
 
     waylandState.xdgToplevel->setConfigure([this](CCXdgToplevel* r, int32_t w, int32_t h, wl_array* arr) {
+        if (needsInitialCommit)
+            return;
+
         backend->backend->log(AQ_LOG_DEBUG, std::format("Output {}: configure toplevel with {}x{}", name, w, h));
         if (w == 0 || h == 0) {
             backend->backend->log(AQ_LOG_DEBUG, std::format("Output {}: w/h is 0, sending default hardcoded 1280x720", name));
@@ -565,19 +583,22 @@ Aquamarine::CWaylandOutput::CWaylandOutput(const std::string& name_, Hyprutils::
 
     waylandState.xdgToplevel->setClose([this](CCXdgToplevel* r) { destroy(); });
 
-    waylandState.xdgToplevel->sendSetTitle(std::format("aquamarine - {}", name).c_str());
-    waylandState.xdgToplevel->sendSetAppId("aquamarine");
-
     auto inputRegion = makeShared<CCWlRegion>(backend->waylandState.compositor->sendCreateRegion());
     inputRegion->sendAdd(0, 0, INT32_MAX, INT32_MAX);
 
+    scanoutDisabled = true;
     waylandState.surface->sendSetInputRegion(inputRegion.get());
-    waylandState.surface->sendAttach(nullptr, 0, 0);
-    waylandState.surface->sendCommit();
+    commitInitialState();
 
     inputRegion->sendDestroy();
 
     backend->backend->log(AQ_LOG_DEBUG, std::format("Output {}: initialized", name));
+}
+
+void Aquamarine::CWaylandOutput::commitInitialState() {
+    waylandState.xdgToplevel->sendSetTitle(std::format("aquamarine - {}", name).c_str());
+    waylandState.xdgToplevel->sendSetAppId("aquamarine");
+    waylandState.surface->sendCommit();
 }
 
 Aquamarine::CWaylandOutput::~CWaylandOutput() {
@@ -624,10 +645,58 @@ bool Aquamarine::CWaylandOutput::test() {
     return true; // TODO:
 }
 
+bool Aquamarine::CWaylandOutput::canConfirmPrivatePresentation() const {
+    return backend->hasPresentationFeedback();
+}
+
+bool Aquamarine::CWaylandOutput::disableForPrivacy() {
+    if (scanoutDisabled || unmapSync)
+        return scanoutDisabled;
+
+    setCursor(nullptr, {});
+    waylandState.surface->sendAttach(nullptr, 0, 0);
+    waylandState.surface->sendCommit();
+    waylandState.frameCallback.reset();
+    privateFeedback.clear();
+    sched.invalidate();
+    configured         = false;
+    needsInitialCommit = true;
+    events.scanoutInvalidated.emit();
+
+    // Round-trip ordering confirms the parent processed the null-buffer commit.
+    unmapSync = makeShared<CCWlCallback>(rc<wl_proxy*>(wl_display_sync(backend->waylandState.display)));
+    unmapSync->setDone([this](CCWlCallback*, uint32_t) {
+        scanoutDisabled = true;
+        events.commit.emit();
+        if (state->state().enabled && (!privateScanout || canConfirmPrivatePresentation()))
+            scheduleFrame(AQ_SCHEDULE_NEEDS_FRAME);
+    });
+    wl_display_flush(backend->waylandState.display);
+    return false;
+}
+
 bool Aquamarine::CWaylandOutput::commit() {
-    const auto  snapshot  = state->snapshot();
-    const auto& STATE     = snapshot.state();
-    Vector2D    pixelSize = {};
+    const auto  snapshot = state->snapshot();
+    const auto& STATE    = snapshot.state();
+    if (!allowsPrivateCommit(STATE))
+        return false;
+    if (privateScanout && !STATE.enabled) {
+        disableForPrivacy();
+        state->consume(snapshot);
+        return true;
+    }
+    if (privateScanout && !canConfirmPrivatePresentation())
+        return false;
+    if (unmapSync && !scanoutDisabled)
+        return false;
+    if (needsInitialCommit) {
+        unmapSync.reset();
+        needsInitialCommit = false;
+        commitInitialState();
+        wl_display_flush(backend->waylandState.display);
+        return false;
+    }
+    Vector2D pixelSize = {};
 
     if (STATE.customMode)
         pixelSize = STATE.customMode->pixelSize;
@@ -667,6 +736,9 @@ bool Aquamarine::CWaylandOutput::commit() {
         return true;
     }
 
+    if (!configured)
+        return false;
+
     auto wlBuffer = wlBufferFromBuffer(STATE.buffer);
 
     if (!wlBuffer) {
@@ -697,6 +769,9 @@ bool Aquamarine::CWaylandOutput::commit() {
         sched.onFrameSubmitted();
     }
 
+    if (privateFrameSerial)
+        trackPrivatePresentation(privateFrameSerial);
+    scanoutDisabled = false;
     waylandState.surface->sendCommit();
     waylandState.surfaceSize = STATE.buffer->size;
 
@@ -738,6 +813,25 @@ SP<CWaylandBuffer> Aquamarine::CWaylandOutput::wlBufferFromBuffer(SP<IBuffer> bu
     return wlBuffer;
 }
 
+void Aquamarine::CWaylandOutput::trackPrivatePresentation(uint64_t serial) {
+    const auto feedback = privateFeedback.emplace_back(makeShared<CCWpPresentationFeedback>(backend->waylandState.presentation->sendFeedback(waylandState.surface->resource())));
+    feedback->setPresented([this, serial](CCWpPresentationFeedback* resource, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, wpPresentationFeedbackKind) {
+        events.privatePresented.emit(serial);
+        forgetPrivateFeedback(resource);
+    });
+    feedback->setDiscarded([this](CCWpPresentationFeedback* resource) {
+        forgetPrivateFeedback(resource);
+        scheduleFrame(AQ_SCHEDULE_NEEDS_FRAME);
+    });
+}
+
+void Aquamarine::CWaylandOutput::forgetPrivateFeedback(CCWpPresentationFeedback* resource) {
+    backend->backend->addIdleEvent(makeShared<std::function<void(void)>>([weak = self, resource] {
+        if (const auto output = weak.lock())
+            std::erase_if(output->privateFeedback, [resource](const auto& entry) { return entry.get() == resource; });
+    }));
+}
+
 void Aquamarine::CWaylandOutput::onFrameDone() {
     // Mirrors DRM's handlePF: settle scheduler state, emit present, then emit frame
     // via the scheduler signal. The loop self-limits — if the consumer doesn't
@@ -754,20 +848,24 @@ void Aquamarine::CWaylandOutput::onFrameDone() {
 }
 
 bool Aquamarine::CWaylandOutput::setCursor(Hyprutils::Memory::CSharedPointer<IBuffer> buffer, const Hyprutils::Math::Vector2D& hotspot) {
+    if (!buffer || privateScanout) {
+        cursorState.cursorBuffer.reset();
+        cursorState.cursorWlBuffer.reset();
+        if (cursorState.cursorSurface) {
+            cursorState.cursorSurface->sendAttach(nullptr, 0, 0);
+            cursorState.cursorSurface->sendCommit();
+        }
+        if (!backend->pointers.empty() && cursorState.serial)
+            backend->pointers.at(0)->pointer->sendSetCursor(cursorState.serial, nullptr, 0, 0);
+        return !buffer;
+    }
+
     if (!cursorState.cursorSurface)
         cursorState.cursorSurface = makeShared<CCWlSurface>(backend->waylandState.compositor->sendCreateSurface());
 
     if (!cursorState.cursorSurface) {
         backend->backend->log(AQ_LOG_ERROR, std::format("Output {}: Failed to create a wl_surface for the cursor", name));
         return false;
-    }
-
-    if (!buffer) {
-        cursorState.cursorBuffer.reset();
-        cursorState.cursorWlBuffer.reset();
-        if (!backend->pointers.empty())
-            backend->pointers.at(0)->pointer->sendSetCursor(cursorState.serial, nullptr, cursorState.hotspot.x, cursorState.hotspot.y);
-        return true;
     }
 
     cursorState.cursorBuffer = buffer;
@@ -843,8 +941,10 @@ void Aquamarine::CWaylandOutput::moveCursor(const Hyprutils::Math::Vector2D& coo
 void Aquamarine::CWaylandOutput::onEnter(SP<CCWlPointer> pointer, uint32_t serial) {
     cursorState.serial = serial;
 
-    if (!cursorState.cursorSurface)
+    if (privateScanout || !cursorState.cursorWlBuffer) {
+        pointer->sendSetCursor(serial, nullptr, 0, 0);
         return;
+    }
 
     pointer->sendSetCursor(serial, cursorState.cursorSurface.get(), cursorState.hotspot.x, cursorState.hotspot.y);
 }

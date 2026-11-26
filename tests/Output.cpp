@@ -58,11 +58,37 @@ class CTestBuffer : public IBuffer {
     virtual bool good() {
         return true;
     }
+
+    SDMABUFAttrs dmabuf() override {
+        return {.success = true, .format = DRM_FORMAT_XRGB8888};
+    }
 };
 
 int main() {
     int         ret = 0;
     CTestOutput output;
+
+    const auto  protectedBuffer = makeShared<CTestBuffer>();
+    protectedBuffer->size       = {1280, 720};
+    COutputState::SInternalState privateState{
+        .committed  = COutputState::AQ_OUTPUT_STATE_BUFFER,
+        .enabled    = true,
+        .customMode = makeShared<SOutputMode>(SOutputMode{.pixelSize = protectedBuffer->size}),
+        .drmFormat  = DRM_FORMAT_XRGB8888,
+        .buffer     = protectedBuffer,
+    };
+    output.privateScanout = true;
+    EXPECT(output.allowsPrivateCommit(privateState), false);
+    output.privateFrame       = protectedBuffer;
+    output.privateFrameSerial = 1;
+    EXPECT(output.allowsPrivateCommit(privateState), true);
+    privateState.customMode->pixelSize = {1920, 1080};
+    EXPECT(output.allowsPrivateCommit(privateState), false);
+    privateState.customMode->pixelSize = protectedBuffer->size;
+    privateState.drmFormat             = DRM_FORMAT_ARGB8888;
+    EXPECT(output.allowsPrivateCommit(privateState), false);
+    privateState.enabled = false;
+    EXPECT(output.allowsPrivateCommit(privateState), true);
 
     CTestBuffer buffer;
     int         backendReleases = 0;

@@ -78,7 +78,7 @@ Aquamarine::CDRMAtomicRequest::~CDRMAtomicRequest() {
 // A fresh blob is required: handing the kernel the same blob id it already holds
 // leaves mode_changed clear, so the driver never redoes the allocation.
 // Returns false if there was nothing to restate.
-bool Aquamarine::CDRMAtomicRequest::restateConnectors(SP<SDRMConnector> self) {
+bool Aquamarine::CDRMAtomicRequest::restateConnectors(SP<SDRMConnector> self, bool disablePrivatePeers) {
     if (failed)
         return false;
 
@@ -90,6 +90,25 @@ bool Aquamarine::CDRMAtomicRequest::restateConnectors(SP<SDRMConnector> self) {
 
         if (!c->output->enabledState)
             continue;
+
+        if (c->output->privateScanout) {
+            if (!disablePrivatePeers)
+                continue;
+
+            // A queued worker must not reactivate this CRTC after the shared disable.
+            if (c->output->pendingAsyncCommit)
+                return false;
+
+            add(c->crtc->id, c->crtc->props.values.mode_id, 0);
+            add(c->crtc->id, c->crtc->props.values.active, 0);
+            add(c->id, c->props.values.crtc_id, 0);
+            planeProps(c->crtc->primary, nullptr, 0, {});
+            if (c->crtc->cursor)
+                planeProps(c->crtc->cursor, nullptr, 0, {});
+            disabledPeers.emplace_back(c);
+            any = true;
+            continue;
+        }
 
         drmModeModeInfo* current = c->getCurrentMode();
         if (!current)
@@ -129,6 +148,19 @@ bool Aquamarine::CDRMAtomicRequest::restateConnectors(SP<SDRMConnector> self) {
     }
 
     return any && !failed;
+}
+
+void Aquamarine::CDRMAtomicRequest::applyDisabledPeers() {
+    for (const auto& peer : disabledPeers) {
+        peer->atomic.propsCached         = false;
+        peer->crtc->atomic.ctmStateKnown = false;
+        peer->output->events.scanoutInvalidated.emit();
+        SDRMConnectorCommitData disable = {.modeset = true};
+        peer->applyCommit(disable);
+        for (const auto& fb : disable.retiredFBs)
+            peer->releaseFBBuffer(fb);
+        peer->output->scheduleFrame(IOutput::AQ_SCHEDULE_NEEDS_FRAME);
+    }
 }
 
 void Aquamarine::CDRMAtomicRequest::add(uint32_t id, uint32_t prop, uint64_t val) {
@@ -394,7 +426,7 @@ bool Aquamarine::CDRMAtomicRequest::commit(uint32_t flagssss) {
 
     // a test never flips.
     const bool WANTSFLIP = conn && conn->crtc && (flagssss & DRM_MODE_PAGE_FLIP_EVENT) && !(flagssss & DRM_MODE_ATOMIC_TEST_ONLY);
-    const auto FLIPID    = WANTSFLIP ? conn->crtc->armPageFlip(conn, flagssss & DRM_MODE_PAGE_FLIP_ASYNC) : uintptr_t{0};
+    const auto FLIPID    = WANTSFLIP ? conn->crtc->armPageFlip(conn, flagssss & DRM_MODE_PAGE_FLIP_ASYNC, std::nullopt, 0, true, conn->output->privateFrameSerial) : uintptr_t{0};
 
     if (auto ret = drmModeAtomicCommit(backend->gpu->fd, req, flagssss, rc<void*>(FLIPID)); ret) {
         backend->log((flagssss & DRM_MODE_ATOMIC_TEST_ONLY) ? AQ_LOG_DEBUG : AQ_LOG_ERROR,
@@ -697,7 +729,8 @@ bool Aquamarine::CDRMAtomicImpl::commit(Hyprutils::Memory::CSharedPointer<SDRMCo
     if (!ok && data.modeset) {
         retry.emplace(backend);
         retry->addConnector(connector, data);
-        if (retry->restateConnectors(connector)) {
+        const bool disablePrivatePeers = data.blocking && (!data.enabled || connector->output->privateFrameSerial != 0);
+        if (retry->restateConnectors(connector, disablePrivatePeers)) {
             ok = retry->commit(flags);
             if (ok)
                 backend->log(AQ_LOG_DEBUG,
@@ -716,6 +749,7 @@ bool Aquamarine::CDRMAtomicImpl::commit(Hyprutils::Memory::CSharedPointer<SDRMCo
     if (ok) {
         applied.apply(data);
         if (!data.test) {
+            applied.applyDisabledPeers();
             // remember which connector_state values the kernel last accepted so the
             // next page-flip can skip emitting unchanged ones (see #265).
             connector->atomic.maxBpc      = data.atomic.maxBpc;

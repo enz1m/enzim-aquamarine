@@ -7,6 +7,27 @@
 
 using namespace Aquamarine;
 
+bool IOutput::disableForPrivacy() {
+    return scanoutDisabled;
+}
+
+bool IOutput::canConfirmPrivatePresentation() const {
+    return true;
+}
+
+bool IOutput::allowsPrivateCommit(const COutputState::SInternalState& state) const {
+    if (!privateScanout || !state.enabled)
+        return true;
+
+    const auto mode = state.customMode ? state.customMode : state.mode.lock();
+    if (!mode || !privateFrameSerial || !state.buffer || privateFrame != state.buffer || state.buffer->size != mode->pixelSize ||
+        state.presentationMode != AQ_OUTPUT_PRESENTATION_VSYNC || !(state.committed & COutputState::AQ_OUTPUT_STATE_BUFFER))
+        return false;
+
+    const auto attrs = state.buffer->dmabuf();
+    return attrs.success && attrs.format == state.drmFormat;
+}
+
 Aquamarine::IOutput::~IOutput() {
     events.destroy.emit();
 }

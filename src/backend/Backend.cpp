@@ -5,6 +5,7 @@
 #include <aquamarine/backend/Null.hpp>
 #include <aquamarine/allocator/GBM.hpp>
 #include <hyprutils/os/FileDescriptor.hpp>
+#include <algorithm>
 #include <ranges>
 #include <sys/timerfd.h>
 #include <ctime>
@@ -260,6 +261,13 @@ std::vector<SDRMFormat> Aquamarine::CBackend::getPrimaryRenderFormats() {
 
 const std::vector<SP<IBackendImplementation>>& Aquamarine::CBackend::getImplementations() {
     return implementations;
+}
+
+bool Aquamarine::CBackend::canConfirmPrivatePresentation() const {
+    return std::ranges::none_of(implementations, [](const auto& implementation) {
+        const auto* nested = dynamic_cast<const CWaylandBackend*>(implementation.get());
+        return nested && !nested->hasPresentationFeedback();
+    });
 }
 
 void Aquamarine::CBackend::addIdleEvent(SP<std::function<void(void)>> fn) {

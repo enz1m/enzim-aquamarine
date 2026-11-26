@@ -68,8 +68,11 @@ Aquamarine::CDRMBackend::CDRMBackend(SP<CBackend> backend_) : backend(backend_) 
             restoreAfterVT();
         } else
             for (const auto& connector : connectors) {
-                if (connector->output)
+                if (connector->output) {
                     cancelAsyncOutput(connector->output.get(), true);
+                    if (connector->output->privateScanout)
+                        connector->output->events.scanoutInvalidated.emit();
+                }
                 connector->invalidateFrame();
             }
     });
@@ -625,6 +628,15 @@ void Aquamarine::CDRMBackend::restoreAfterVT() {
         if (!c->crtc || !c->output)
             continue;
 
+        if (c->output->privateScanout) {
+            c->output->scanoutDisabled = false;
+            c->output->events.scanoutInvalidated.emit();
+            if (!c->output->disableForPrivacy())
+                log(AQ_LOG_ERROR, std::format("drm: Failed to disable {} while restoring private scanout", c->szName));
+            c->output->scheduleFrame(IOutput::AQ_SCHEDULE_NEEDS_FRAME);
+            continue;
+        }
+
         auto&                   STATE = c->output->state->state();
 
         SDRMConnectorCommitData data = {
@@ -977,7 +989,7 @@ void Aquamarine::CDRMBackend::recheckCRTCs() {
         }
 
         // disabled outputs release their CRTCs so active outputs get priority
-        if (c->crtc && c->status == DRM_MODE_CONNECTED && c->output && !c->output->enabledState) {
+        if (c->crtc && c->status == DRM_MODE_CONNECTED && c->output && !c->output->enabledState && !(c->output->privateScanout && c->output->state->state().enabled)) {
             backend->log(AQ_LOG_DEBUG, std::format("drm: {} is disabled, releasing crtc {}", c->szName, c->crtc->id));
             c->setCRTC(nullptr);
         }
@@ -1392,7 +1404,8 @@ SP<SDRMCRTC> Aquamarine::CDRMBackend::crtcByID(uint32_t id) {
     return it == crtcs.end() ? nullptr : *it;
 }
 
-uintptr_t Aquamarine::SDRMCRTC::armPageFlip(CWeakPointer<SDRMConnector> connector, bool async, std::optional<uintptr_t> requestedID, uint64_t commitID, bool resultReady) {
+uintptr_t Aquamarine::SDRMCRTC::armPageFlip(CWeakPointer<SDRMConnector> connector, bool async, std::optional<uintptr_t> requestedID, uint64_t commitID, bool resultReady,
+                                            uint64_t privateFrameSerial) {
     if (pendingFlip.id && !(pendingFlip.connector == connector)) {
         if (const auto PREV = pendingFlip.connector.lock()) {
             backend->log(AQ_LOG_ERROR, std::format("drm: crtc {} page-flip slot taken from {}, dropping its frame", id, PREV->szName));
@@ -1400,12 +1413,13 @@ uintptr_t Aquamarine::SDRMCRTC::armPageFlip(CWeakPointer<SDRMConnector> connecto
         }
     }
 
-    pendingFlip.id          = requestedID.value_or(backend->nextPageFlipID());
-    pendingFlip.connector   = connector;
-    pendingFlip.async       = async;
-    pendingFlip.commitID    = commitID;
-    pendingFlip.resultReady = resultReady;
-    pendingFlip.early.valid = false;
+    pendingFlip.id                 = requestedID.value_or(backend->nextPageFlipID());
+    pendingFlip.connector          = connector;
+    pendingFlip.async              = async;
+    pendingFlip.commitID           = commitID;
+    pendingFlip.privateFrameSerial = privateFrameSerial;
+    pendingFlip.resultReady        = resultReady;
+    pendingFlip.early.valid        = false;
 
     return pendingFlip.id.value();
 }
@@ -1413,10 +1427,11 @@ uintptr_t Aquamarine::SDRMCRTC::armPageFlip(CWeakPointer<SDRMConnector> connecto
 void Aquamarine::SDRMCRTC::disarmPageFlip() {
     pendingFlip.id.reset();
     pendingFlip.connector.reset();
-    pendingFlip.async       = false;
-    pendingFlip.commitID    = 0;
-    pendingFlip.resultReady = true;
-    pendingFlip.early.valid = false;
+    pendingFlip.async              = false;
+    pendingFlip.commitID           = 0;
+    pendingFlip.privateFrameSerial = 0;
+    pendingFlip.resultReady        = true;
+    pendingFlip.early.valid        = false;
 }
 
 static CWeakPointer<CDRMBackend> gDispatchingBackend;
@@ -1446,9 +1461,10 @@ void Aquamarine::CDRMBackend::handlePageFlip(uintptr_t flipID, unsigned int seq,
         return;
     }
 
-    const auto CONNECTOR = CRTC->pendingFlip.connector.lock();
-    const auto ASYNC     = CRTC->pendingFlip.async;
-    const auto COMMIT_ID = CRTC->pendingFlip.commitID;
+    const auto CONNECTOR      = CRTC->pendingFlip.connector.lock();
+    const auto ASYNC          = CRTC->pendingFlip.async;
+    const auto COMMIT_ID      = CRTC->pendingFlip.commitID;
+    const auto PRIVATE_SERIAL = CRTC->pendingFlip.privateFrameSerial;
     CRTC->disarmPageFlip();
 
     if (commitThread && COMMIT_ID)
@@ -1490,6 +1506,8 @@ void Aquamarine::CDRMBackend::handlePageFlip(uintptr_t flipID, unsigned int seq,
         if (gpuDriver() == AQ_BACKEND_GPU_DRIVER_NVIDIA && seq == 0)
             flags &= ~IOutput::AQ_OUTPUT_PRESENT_HW_CLOCK;
 
+        if (PRIVATE_SERIAL && sessionActive())
+            CONNECTOR->output->events.privatePresented.emit(PRIVATE_SERIAL);
         CONNECTOR->output->events.present.emit(IOutput::SPresentEvent{
             .presented = sessionActive(),
             .when      = &presented,
@@ -2015,6 +2033,9 @@ void Aquamarine::SDRMConnector::connect(drmModeConnector* connector) {
     output            = SP<CDRMOutput>(new CDRMOutput(szName, backend, self.lock()));
     output->self      = output;
     output->connector = self.lock();
+    // A connector without a CRTC cannot scan out until one is assigned.
+    if (!crtc)
+        output->scanoutDisabled = true;
 
     backend->backend->log(AQ_LOG_DEBUG, "drm: Dumping detected modes:");
 
@@ -2160,6 +2181,16 @@ void Aquamarine::SDRMConnector::disconnect() {
     output.reset();
 }
 
+bool Aquamarine::SDRMConnector::disableScanout() {
+    SDRMConnectorCommitData data = {
+        .outputState = output->state->state(),
+        .modeset     = true,
+        .blocking    = true,
+        .committed   = COutputState::AQ_OUTPUT_STATE_ENABLED,
+    };
+    return commitState(data);
+}
+
 bool Aquamarine::SDRMConnector::commitState(SDRMConnectorCommitData& data) {
     if (status != DRM_MODE_CONNECTED || !output)
         return false;
@@ -2238,8 +2269,9 @@ void Aquamarine::SDRMConnector::applyCommit(SDRMConnectorCommitData& data) {
     if (data.committed & COutputState::AQ_OUTPUT_STATE_MODE)
         refresh = calculateRefresh(data.modeInfo);
 
-    const bool wasEnabled = output->enabledState;
-    output->enabledState  = data.enabled;
+    const bool wasEnabled   = output->enabledState;
+    output->enabledState    = data.enabled;
+    output->scanoutDisabled = !data.enabled;
 
     if (!output->enabledState)
         invalidateFrame();
@@ -2298,6 +2330,8 @@ void Aquamarine::SDRMConnector::setCRTC(SP<SDRMCRTC> newCRTC) {
     invalidateFrame();
 
     crtc = newCRTC;
+    if (!crtc && output)
+        output->scanoutDisabled = true;
 }
 
 void Aquamarine::SDRMConnector::onPresent(bool primary, bool cursor, DRMFBList* deferred) {
@@ -2346,6 +2380,24 @@ void Aquamarine::CDRMOutput::releaseMgpuResources() {
         options.length = 0;
         swapchain->reconfigure(options);
     }
+}
+
+bool Aquamarine::CDRMOutput::disableForPrivacy() {
+    if (scanoutDisabled)
+        return true;
+    if (!connector->crtc) {
+        scanoutDisabled = true;
+        return true;
+    }
+    if (!privateScanout || !backend->sessionActive())
+        return false;
+
+    const auto key = connector->crtc->id;
+    backend->cancelAsyncOutput(this, true);
+    if (pendingAsyncCommit || !backend->pauseCommitQueue(key))
+        return false;
+    CScopeGuard resume([this, key] { backend->resumeCommitQueue(key); });
+    return connector->disableScanout();
 }
 
 bool Aquamarine::CDRMOutput::commit() {
@@ -2504,6 +2556,8 @@ bool Aquamarine::CDRMOutput::prepareAsyncCommitData(const COutputState::CSnapsho
 }
 
 bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
+    if (!onlyTest && !allowsPrivateCommit(state->state()))
+        return false;
     if (!backend->backend->session->active) {
         backend->backend->log(AQ_LOG_ERROR, "drm: Session inactive");
         return false;
@@ -2578,7 +2632,7 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
 
     // If we are changing the rendering format, we may need to reconfigure the output (aka modeset)
     // which may result in some glitches
-    const bool NEEDS_RECONFIG = SNAPSHOT.needsReconfig();
+    const bool NEEDS_RECONFIG = SNAPSHOT.needsReconfig() || (privateScanout && STATE.enabled != enabledState);
 
     const bool BLOCKING = NEEDS_RECONFIG || !(COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_BUFFER);
 
@@ -2754,6 +2808,11 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
     data.test      = onlyTest;
     data.enabled   = STATE.enabled;
     data.committed = COMMITTED;
+    if (privateScanout && !onlyTest) {
+        data.cursorFB.reset();
+        data.cursorVisible = false;
+        data.committed |= COutputState::AQ_OUTPUT_STATE_CURSOR_SHAPE;
+    }
     if (COMMITTED & COutputState::eOutputStateProperties::AQ_OUTPUT_STATE_DAMAGE)
         data.damage = STATE.damage.copy();
     if (MODE->modeInfo.has_value())
@@ -2767,7 +2826,8 @@ bool Aquamarine::CDRMOutput::commitState(bool onlyTest) {
     // making larger modes unreachable.
     // If the consumer already reconfigured the swapchain to the new size, attach a fresh buffer from it.
     bool acquiredModesetBuffer = false;
-    if (data.modeset && data.mainFB && swapchain && data.mainFB->buffer->size != MODE->pixelSize && swapchain->currentOptions().size == MODE->pixelSize) {
+    if ((onlyTest || !privateScanout) && data.modeset && data.mainFB && swapchain && data.mainFB->buffer->size != MODE->pixelSize &&
+        swapchain->currentOptions().size == MODE->pixelSize) {
         if (auto newBuf = swapchain->next(nullptr); newBuf) {
             if (auto newFB = CDRMFB::create(newBuf, backend, nullptr); newFB && !newFB->dead) {
                 data.mainFB           = newFB;
@@ -2958,7 +3018,7 @@ void Aquamarine::CDRMOutput::scheduleFrame(const scheduleFrameReason reason) {
                                             connector->sched.frameInFlight(), connector->sched.frameScheduled())));
     needsFrame = true;
 
-    if (!enabledState)
+    if (!enabledState && !(privateScanout && state->state().enabled))
         return;
 
     // a scheduleFrame mid frame, reschedule one more.
@@ -3062,6 +3122,9 @@ uint32_t Aquamarine::CDRMOutput::commitCapabilities() const {
 }
 
 Aquamarine::IOutput::SCommitSubmission Aquamarine::CDRMOutput::commitAsync(const SCommitOptions& options) {
+    if (privateScanout || !enabledState)
+        return {.error = ENOTSUP};
+
     const auto CAPABILITIES = commitCapabilities();
     if (!(CAPABILITIES & AQ_OUTPUT_COMMIT_CAPABILITY_QUEUED))
         return {.error = ENOTSUP};
